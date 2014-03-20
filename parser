@@ -1,0 +1,177 @@
+#!/usr/bin/env python
+import sys
+import ipaddress
+import re
+from scapy.all import *
+
+class Rule(object):
+    def __init__(self, predicate, actions, count):
+        self.predicate = predicate
+        self.priority  = predicate['priority']
+        self.actions   = actions
+        self.packet    = None
+        self.count     = count
+
+    @property
+    def actions(self):
+        return self._actions
+
+    @actions.setter
+    def actions(self, value):
+        self._actions = value
+
+    @property
+    def predicate(self):
+        return self._predicate
+
+    @predicate.setter
+    def predicate(self, value):
+        self._predicate = value
+
+    @property
+    def priority(self):
+        return self._priority
+
+    @priority.setter
+    def priority(self, value):
+        self._priority = value
+
+
+def parse(f):
+    with open(f) as fl:
+        def parse_line(line):
+            sections  = (line.strip().split(" "))
+            count     = sections[3].rstrip().split("=")[1]
+            count     = re.sub(r'[^0-9\.]', "", count)
+            predicate = sections[5].rstrip()
+            actions   = sections[6].rstrip().split("=")[-1]
+
+            def parse_predicate(predicate):
+                fields = {}
+                def parse_field(x):
+                    parts = x.split("=")
+                    if len(parts) == 1:
+                        if parts[0] == 'ip':
+                            parts[0] = 0x0800
+                        elif parts[0] == 'udp':
+                            fields['protocol'] = 17
+                            fields['ethtype']  = 0x0800
+                        elif parts[0] == 'udp6':
+                            fields['protocol'] = 17
+                            fields['ethtype']  = 0x86dd
+                        elif parts[0] == 'tcp':
+                            fields['protocol'] = 6
+                            fields['ethtype']  = 0x0800
+                        elif parts[0] == 'tcp6':
+                            fields['protocol'] = 6
+                            fields['ethtype']  = 0x86dd
+                        elif parts[0] == 'ip':
+                            fields['ethtype']  = 0x0800
+                        elif parts[0] == 'arp':
+                            fields['ethtype']  = 0x0806
+                        elif parts[0] == 'icmp':
+                            fields['protocol'] = 1
+                            fields['ethtype']  = 0x0800
+                        elif parts[0] == 'icmp6':
+                            fields['protocol'] = 1
+                            fields['ethtype']  = 0x86dd
+                        else:
+                            raise Exception(parts[0])
+                        parts.insert(0, 'ethtype')
+                    else:
+                        if parts[0] == 'nw_dst':
+                            if '/' not in parts[1]:
+                                parts[1] = parts[1] + '/32'
+                            parts[1] = ipaddress.ip_network(unicode(parts[1]))
+                        elif parts[0] == 'priority':
+                            parts[1] = int(parts[1])
+                        fields[parts[0]] = parts[1]
+
+                for field in predicate.split(","):
+                    parse_field(field)
+
+                if 'ethtype' not in  fields and 'nw_dst' in fields:
+                    fields['ethtype'] = 0x800
+
+                return fields
+
+            def parse_actions(actions):
+                def parse_action(x):
+                    key, val = None, None
+                    parts = x.split(":")
+                    t = parts[0]
+                    action = ":".join(parts[1:])
+                    
+                    if t == 'set_field':
+                        val, key = action.split("->")
+                    elif t == 'output':
+                        key, val = 'outport', int(action)
+                    elif t == 'CONTROLLER':
+                        key, val = 'outport', 0xfffffffd
+                    elif t == 'drop':
+                        return 'drop'
+
+                    return [key,val]
+
+                dictionary = map(parse_action, actions.split(","))
+
+                if 'drop' in dictionary:
+                    return {}
+
+                return dict(dictionary)
+            return {'predicate': parse_predicate(predicate), 'actions': parse_actions(actions), 'count': int(count)}
+
+        return map(lambda x: Rule(**x), map(parse_line, fl))
+
+rules = parse(sys.argv[1])
+
+def generate_packets(rule_list):
+    rule_list = sorted(rule_list, key=lambda rule: -rule.priority)
+    available_space = [ipaddress.IPv4Network(u'0.0.0.0/0')]
+    idx = 0
+    for rule in rule_list:
+        idx += 1
+        print("Processing : %d", idx, len(available_space))
+        if ('ethtype' in rule.predicate) \
+            and (rule.predicate['ethtype'] == 0x800) \
+            and (rule.actions['outport'] < 65536):
+            ns = []
+            ss = rule.predicate['nw_dst']
+            iss = int(ss.network_address)
+            for space in available_space:
+                ispace = int(space.network_address)
+                if rule.packet is None:
+                    if (iss & ispace == iss):
+                        rule.packet = space
+                    elif (iss & ispace == ispace):
+                        rule.packet = ss
+                try:
+                    ns += list(space.address_exclude(ss))
+                    continue
+                except ValueError:
+                    pass
+
+                try:
+                    ss.address_exclude(space).next()
+                except ValueError:
+                    ns += [space]
+            available_space = ns
+
+    return rule_list
+
+pfile = PcapWriter(sys.argv[2], append=True, sync=True)
+for rule in generate_packets(rules[:100]):
+    if rule.packet and rule.packet.hosts: 
+        try:
+            host = rule.packet.hosts().next()
+        except Exception:
+            continue
+        print rule.count
+        print rule.predicate
+        l2, l3, l4 = Ether(dst=rule.predicate['dl_dst']), None, None
+        if rule.predicate['ethtype'] == 2048:
+            l3 = IP(dst=str(host))/ICMP()
+        else:
+            raise ValueError("No matching ethertype ......")
+
+        pfile.write(l2/l3)
