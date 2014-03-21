@@ -168,10 +168,11 @@ for rule in generate_packets(rules[:100]):
             continue
         print rule.count
         print rule.predicate
-        l2, l3, l4 = Ether(dst=rule.predicate['dl_dst']), None, None
+        l2, l3, l4 = Ether(src='00:01:00:10:00:10', dst=rule.predicate['dl_dst']), None, None
         if rule.predicate['ethtype'] == 2048:
-            l3 = IP(dst=str(host))/ICMP()
+            l3 = IP(src=str(host))/ICMP()
         else:
             raise ValueError("No matching ethertype ......")
 
+        sendp(l2/l3)
         pfile.write(l2/l3)
